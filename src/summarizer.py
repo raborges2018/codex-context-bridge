@@ -1,170 +1,161 @@
-"""Resumo offline por heurísticas, sem uso de APIs externas de IA."""
+"""Resumo offline com detecção automática de tipo de entrada."""
 
 from __future__ import annotations
 
 import re
 from collections import Counter
-from typing import Iterable, List
+from typing import List
 
 from src.config import PRIORITY_TERMS
-from src.intent_router import resolve_next_action
 
-FILE_RE = re.compile(r"(?:[\w./-]+\.(?:py|js|ts|tsx|jsx|md|txt|json|yml|yaml|log|env\.example))")
-COMMAND_RE = re.compile(r"^\s*(?:\$|>|npm\s|yarn\s|pnpm\s|python\s|-m\s|git\s|pytest\s|ruff\s|flake8\s|uv\s)", re.IGNORECASE)
-ERROR_RE = re.compile(r"\b(error|exception|failed|traceback|fatal|risk|warning|warn)\b", re.IGNORECASE)
-DECISION_RE = re.compile(r"\b(decid|escolh|optou|arquitetura|padr[aã]o|estrat[eé]gia|adotad)\b", re.IGNORECASE)
-NEXT_RE = re.compile(r"\b(todo|fixme|next|pr[oó]xim|seguir|implementar|ajustar|corrigir)\b", re.IGNORECASE)
-STATE_RE = re.compile(r"\b(modified|created|deleted|commit|pr|branch|build|test|lint|merge)\b", re.IGNORECASE)
-
-
-def _compact_lines(text: str, max_lines: int = 12) -> List[str]:
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    return lines[:max_lines]
+ERROR_RE = re.compile(r"\b(error|exception|failed|traceback|fatal|warning|warn)\b", re.IGNORECASE)
+PATH_RE = re.compile(r"\b(?:src/|app/|components/|services/|lib/|package\.json|[\w./-]+\.(?:py|ts|tsx|js|jsx|json|md|log|yml|yaml))\b")
+DIFF_RE = re.compile(r"\b(diff|commit|pull request|\bpr\b|branch|@@|\+\+\+|---)\b", re.IGNORECASE)
+LOG_RE = re.compile(r"\b(INFO|DEBUG|WARN|ERROR|Traceback|Exception|\d{2}:\d{2}:\d{2})\b")
+TERMINAL_RE = re.compile(r"^\s*(\$|>|git\s|npm\s|yarn\s|pnpm\s|python\s|pytest\s|ruff\s|flake8\s)", re.IGNORECASE)
+QUESTION_HINT_RE = re.compile(r"\b(como|qual|quais|devo|posso|melhor|vale|tem problema|devo|por que|pq)\b", re.IGNORECASE)
 
 
-def _extract_by_regex(text: str, pattern: re.Pattern[str], cap: int = 15) -> List[str]:
-    found: List[str] = []
-    for line in text.splitlines():
-        if pattern.search(line):
-            candidate = line.strip()
-            if candidate and candidate not in found:
-                found.append(candidate)
-        if len(found) >= cap:
-            break
-    return found
+def _non_empty_lines(content: str) -> List[str]:
+    return [line.strip() for line in content.splitlines() if line.strip()]
 
 
-def _extract_commands(text: str, cap: int = 10) -> List[str]:
-    out: List[str] = []
-    for line in text.splitlines():
-        if COMMAND_RE.search(line):
-            cmd = line.strip()
-            if cmd not in out:
-                out.append(cmd)
-        if len(out) >= cap:
-            break
-    return out
+def detect_input_type(content: str) -> str:
+    lines = _non_empty_lines(content)
+    char_count = len(content)
+
+    question_score = 0
+    technical_score = 0
+
+    if char_count < 900:
+        question_score += 2
+    if "?" in content:
+        question_score += 2
+    if QUESTION_HINT_RE.search(content):
+        question_score += 2
+
+    path_hits = len(PATH_RE.findall(content))
+    if path_hits > 4:
+        technical_score += 2
+
+    if ERROR_RE.search(content):
+        technical_score += 3
+    if DIFF_RE.search(content):
+        technical_score += 3
+    if any(TERMINAL_RE.search(line) for line in lines[:100]):
+        technical_score += 2
+
+    log_lines = sum(1 for line in lines if LOG_RE.search(line))
+    if log_lines > 8:
+        technical_score += 2
+
+    # Regras de exclusão para pergunta simples
+    if technical_score >= question_score:
+        return "technical_context"
+    return "question"
 
 
-def _extract_files(text: str, cap: int = 30) -> List[str]:
-    files = FILE_RE.findall(text)
-    unique = []
-    for file in files:
-        if file not in unique:
-            unique.append(file)
-        if len(unique) >= cap:
-            break
-    return unique
-
-
-def _infer_objective(intent: str, lines: List[str]) -> str:
-    if not lines:
-        return "Não identificado no conteúdo recebido."
-    seed = " ".join(lines[:3])
-    return f"Com base na intenção '{intent}', o conteúdo indica foco em: {seed[:280]}."
-
-
-def _infer_state(lines: List[str]) -> List[str]:
-    states = [line for line in lines if STATE_RE.search(line)]
-    return states[:8]
-
-
-def _extract_decisions(text: str) -> List[str]:
-    return _extract_by_regex(text, DECISION_RE, cap=10)
-
-
-def _extract_next_steps(text: str) -> List[str]:
-    return _extract_by_regex(text, NEXT_RE, cap=8)
-
-
-def _format_list(items: Iterable[str]) -> str:
-    items = [it for it in items if it]
-    if not items:
-        return "- Não identificado no conteúdo recebido."
-    return "\n".join(f"- {item}" for item in items)
-
-
-def build_offline_markdown(
-    *,
-    intent: str,
-    additional_instruction: str,
-    sources: List[str],
-    selected_text: str,
-    original_size: int,
-) -> str:
-    lines = _compact_lines(selected_text, max_lines=50)
-    objective = _infer_objective(intent, lines)
-    state = _infer_state(lines)
-    files = _extract_files(selected_text)
-    errors = _extract_by_regex(selected_text, ERROR_RE, cap=15)
-    commands = _extract_commands(selected_text, cap=10)
-    decisions = _extract_decisions(selected_text)
-    next_steps = _extract_next_steps(selected_text)
-
-    score_counter = Counter()
+def _extract_essential_snippets(content: str, max_lines: int = 10) -> List[str]:
+    lines = _non_empty_lines(content)
+    scored = Counter()
     for line in lines:
         lower = line.lower()
-        score_counter[line] = sum(1 for term in PRIORITY_TERMS if term in lower)
-    essential = [line for line, _ in score_counter.most_common(8) if line]
-    if not essential:
-        essential = lines[:6]
+        scored[line] = sum(1 for term in PRIORITY_TERMS if term in lower)
+        if ERROR_RE.search(line):
+            scored[line] += 3
+        if DIFF_RE.search(line):
+            scored[line] += 2
+        if PATH_RE.search(line):
+            scored[line] += 1
+        if TERMINAL_RE.search(line):
+            scored[line] += 1
+    best = [line for line, _ in scored.most_common(max_lines) if line]
+    return best or lines[:max_lines]
 
-    next_action = resolve_next_action(intent)
-    if additional_instruction.strip():
-        next_action = f"{next_action} Considere também: {additional_instruction.strip()}"
 
-    prompt_colar = (
-        f"Intenção: {intent}.\n"
-        f"Ação solicitada: {next_action}\n"
-        "Use o contexto compactado abaixo para executar a próxima etapa com precisão."
+def _extract_question(content: str) -> str:
+    lines = _non_empty_lines(content)
+    question_lines = [line for line in lines if "?" in line]
+    if question_lines:
+        return question_lines[-1]
+    if lines:
+        return lines[0]
+    return "Não identificado no conteúdo recebido."
+
+
+def _minimal_context(content: str) -> str:
+    lines = _extract_essential_snippets(content, max_lines=4)
+    if not lines:
+        return "Não identificado no conteúdo recebido."
+    return "\n".join(f"- {line}" for line in lines)
+
+
+def _calc_metrics(original: int, final: int) -> str:
+    reduction = 0.0 if original == 0 else ((original - final) / original) * 100
+    return (
+        f"- Tamanho original: {original} caracteres\n"
+        f"- Tamanho final: {final} caracteres\n"
+        f"- Redução aproximada: {reduction:.2f}%"
     )
 
-    final_markdown = f"""# Contexto Compactado para Claude
 
-## 1. Objetivo
-{objective}
+def build_offline_markdown(*, intent: str, additional_instruction: str, selected_text: str, original_size: int) -> str:
+    input_type = detect_input_type(selected_text)
 
-## 2. Estado atual do projeto
-{_format_list(state)}
+    if input_type == "question":
+        question = _extract_question(selected_text)
+        context_min = _minimal_context(selected_text)
+        if additional_instruction.strip():
+            question = f"{question} ({additional_instruction.strip()})"
 
-## 3. Fontes analisadas
-{_format_list(sources)}
+        prompt = f"""--- PROMPT PARA CLAUDE ---
 
-## 4. Arquivos relevantes
-{_format_list(files)}
+Estou trabalhando no seguinte contexto técnico:
 
-## 5. Decisões técnicas identificadas
-{_format_list(decisions)}
+{context_min}
 
-## 6. Problemas, erros ou riscos
-{_format_list(errors)}
+Minha dúvida é:
 
-## 7. Trechos essenciais preservados
-{_format_list(essential)}
+{question}
 
-## 8. Próxima ação recomendada para o Claude
-{next_action}
-
-## 9. Prompt pronto para colar no Claude
-```text
-{prompt_colar}
-```
-
-## 10. Dados de compactação
-- tamanho aproximado original: {original_size} chars
-- tamanho aproximado final: {{final_size_placeholder}} chars
-- redução aproximada: {{reduction_placeholder}}%
+Responda de forma objetiva, prática e sem rodeios.
 """
+        final_size = len(prompt)
+        metrics = _calc_metrics(original_size, final_size)
+        return (
+            f"{prompt}\n"
+            f"--- DADOS DE COMPACTAÇÃO ---\n\n"
+            f"- Tipo detectado: pergunta simples\n"
+            f"{metrics}"
+        )
 
-    # Acrescenta comandos e próximos passos somente com evidência.
-    if commands:
-        final_markdown += "\n\n### Comandos identificados\n" + _format_list(commands)
-    if next_steps:
-        final_markdown += "\n\n### Próximos passos mencionados no conteúdo\n" + _format_list(next_steps)
+    snippets = _extract_essential_snippets(selected_text, max_lines=12)
+    context_text = "\n".join(f"- {line}" for line in snippets) if snippets else "- Não identificado no conteúdo recebido."
+    intent_text = intent if intent.strip() else "Não identificado no conteúdo recebido."
+    if additional_instruction.strip():
+        intent_text = f"{intent_text} | Instrução adicional: {additional_instruction.strip()}"
 
-    final_size = len(final_markdown)
-    reduction = 0.0 if original_size == 0 else ((original_size - final_size) / original_size) * 100
-    final_markdown = final_markdown.replace("{final_size_placeholder}", str(final_size)).replace(
-        "{reduction_placeholder}", f"{reduction:.2f}"
+    prompt = f"""--- PROMPT PARA CLAUDE ---
+
+Analise o contexto técnico abaixo e me diga exatamente o que fazer.
+
+Contexto:
+{context_text}
+
+Minha intenção:
+{intent_text}
+
+Responda com:
+1. Diagnóstico direto
+2. Riscos
+3. Próxima ação recomendada
+4. Comandos ou ajustes necessários, se houver
+"""
+    final_size = len(prompt)
+    metrics = _calc_metrics(original_size, final_size)
+    return (
+        f"{prompt}\n"
+        f"--- DADOS DE COMPACTAÇÃO ---\n\n"
+        f"- Tipo detectado: contexto técnico\n"
+        f"{metrics}"
     )
-    return final_markdown

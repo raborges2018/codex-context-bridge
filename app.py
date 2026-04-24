@@ -76,7 +76,6 @@ if st.button("7) Gerar contexto compacto", type="primary"):
                 summary = build_offline_markdown(
                     intent=intent,
                     additional_instruction=additional_instruction,
-                    sources=[src for src, _ in cleaned_records],
                     selected_text=selected_text,
                     original_size=original_size,
                 )
